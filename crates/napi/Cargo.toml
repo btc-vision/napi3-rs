@@ -25,7 +25,12 @@ async = ["tokio_rt"]
 chrono_date = ["chrono", "napi5"]
 # Enable deprecated types and traits for compatibility
 compat-mode = []
-default = ["napi4"] # for most Node.js users
+default = [
+  "napi4",
+  "napi9",
+  "trace-buffer-drops",
+  "unsafe_send_sync",
+] # for most Node.js users
 deferred_trace = ["napi4"]
 error_anyhow = ["anyhow"]
 experimental = ["napi-sys/experimental"]
@@ -37,6 +42,8 @@ full = [
   "experimental",
   "chrono_date",
 ]
+trace-buffer-drops = []
+unsafe_send_sync = []
 object_indexmap = ["indexmap"]
 latin1 = ["encoding_rs"]
 napi1 = []

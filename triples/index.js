@@ -1,392 +1,294 @@
 
 export const platformArchTriples = {
-  "darwin": {
-    "arm64": [
-      {
-        "triple": "aarch64-apple-darwin",
-        "platformArchABI": "darwin-arm64",
-        "platform": "darwin",
-        "arch": "arm64",
-        "abi": null
-      }
-    ],
-    "x64": [
-      {
-        "triple": "x86_64-apple-darwin",
-        "platformArchABI": "darwin-x64",
-        "platform": "darwin",
-        "arch": "x64",
-        "abi": null
-      }
-    ]
-  },
-  "ios": {
-    "arm64": [
-      {
-        "triple": "aarch64-apple-ios",
-        "platformArchABI": "ios-arm64",
-        "platform": "ios",
-        "arch": "arm64",
-        "abi": null
-      }
-    ],
-    "x64": [
-      {
-        "triple": "x86_64-apple-ios",
-        "platformArchABI": "ios-x64",
-        "platform": "ios",
-        "arch": "x64",
-        "abi": null
-      }
-    ]
-  },
-  "android": {
-    "arm64": [
-      {
-        "triple": "aarch64-linux-android",
-        "platformArchABI": "android-arm64",
-        "platform": "android",
-        "arch": "arm64",
-        "abi": null
-      }
-    ],
-    "arm": [
-      {
-        "triple": "armv7-linux-androideabi",
-        "platformArchABI": "android-arm-eabi",
-        "platform": "android",
-        "arch": "arm",
-        "abi": "eabi"
-      }
-    ],
-    "ia32": [
-      {
-        "triple": "i686-linux-android",
-        "platformArchABI": "android-ia32",
-        "platform": "android",
-        "arch": "ia32",
-        "abi": null
-      }
-    ],
-    "x64": [
-      {
-        "triple": "x86_64-linux-android",
-        "platformArchABI": "android-x64",
-        "platform": "android",
-        "arch": "x64",
-        "abi": null
-      }
-    ]
-  },
   "win32": {
     "arm64": [
       {
-        "triple": "aarch64-pc-windows-msvc",
-        "platformArchABI": "win32-arm64-msvc",
+        "triple": "aarch64-pc-windows-msvc\r",
+        "platformArchABI": "win32-arm64-msvc\r",
         "platform": "win32",
         "arch": "arm64",
-        "abi": "msvc"
+        "abi": "msvc\r"
       }
     ],
     "ia32": [
       {
-        "triple": "i686-pc-windows-gnu",
-        "platformArchABI": "win32-ia32-gnu",
+        "triple": "i686-pc-windows-gnu\r",
+        "platformArchABI": "win32-ia32-gnu\r",
         "platform": "win32",
         "arch": "ia32",
-        "abi": "gnu"
+        "abi": "gnu\r"
       },
       {
-        "triple": "i686-pc-windows-msvc",
-        "platformArchABI": "win32-ia32-msvc",
+        "triple": "i686-pc-windows-msvc\r",
+        "platformArchABI": "win32-ia32-msvc\r",
         "platform": "win32",
         "arch": "ia32",
-        "abi": "msvc"
+        "abi": "msvc\r"
       }
     ],
     "x64": [
       {
-        "triple": "x86_64-pc-windows-gnu",
-        "platformArchABI": "win32-x64-gnu",
+        "triple": "x86_64-pc-windows-gnu\r",
+        "platformArchABI": "win32-x64-gnu\r",
         "platform": "win32",
         "arch": "x64",
-        "abi": "gnu"
+        "abi": "gnu\r"
       },
       {
-        "triple": "x86_64-pc-windows-msvc",
-        "platformArchABI": "win32-x64-msvc",
+        "triple": "x86_64-pc-windows-msvc\r",
+        "platformArchABI": "win32-x64-msvc\r",
         "platform": "win32",
         "arch": "x64",
-        "abi": "msvc"
+        "abi": "msvc\r"
       }
     ]
   },
   "linux": {
     "arm64": [
       {
-        "triple": "aarch64-unknown-linux-gnu",
-        "platformArchABI": "linux-arm64-gnu",
+        "triple": "aarch64-unknown-linux-gnu\r",
+        "platformArchABI": "linux-arm64-gnu\r",
         "platform": "linux",
         "arch": "arm64",
-        "abi": "gnu"
+        "abi": "gnu\r"
       },
       {
-        "triple": "aarch64-unknown-linux-musl",
-        "platformArchABI": "linux-arm64-musl",
+        "triple": "aarch64-unknown-linux-musl\r",
+        "platformArchABI": "linux-arm64-musl\r",
         "platform": "linux",
         "arch": "arm64",
-        "abi": "musl"
+        "abi": "musl\r"
       }
     ],
     "arm": [
       {
-        "triple": "arm-unknown-linux-gnueabi",
-        "platformArchABI": "linux-arm-gnu",
+        "triple": "arm-unknown-linux-gnueabi\r",
+        "platformArchABI": "linux-arm-gnueabi\r",
         "platform": "linux",
         "arch": "arm",
-        "abi": "gnu"
+        "abi": "gnueabi\r"
       },
       {
-        "triple": "arm-unknown-linux-gnueabihf",
-        "platformArchABI": "linux-arm-gnueabihf",
+        "triple": "arm-unknown-linux-gnueabihf\r",
+        "platformArchABI": "linux-arm-gnueabihf\r",
         "platform": "linux",
         "arch": "arm",
-        "abi": "gnueabihf"
+        "abi": "gnueabihf\r"
       },
       {
-        "triple": "arm-unknown-linux-musleabi",
-        "platformArchABI": "linux-arm-musl",
+        "triple": "arm-unknown-linux-musleabi\r",
+        "platformArchABI": "linux-arm-musleabi\r",
         "platform": "linux",
         "arch": "arm",
-        "abi": "musl"
+        "abi": "musleabi\r"
       },
       {
-        "triple": "arm-unknown-linux-musleabihf",
-        "platformArchABI": "linux-arm-musleabihf",
+        "triple": "arm-unknown-linux-musleabihf\r",
+        "platformArchABI": "linux-arm-musleabihf\r",
         "platform": "linux",
         "arch": "arm",
-        "abi": "musleabihf"
+        "abi": "musleabihf\r"
       },
       {
-        "triple": "armv7-unknown-linux-gnueabi",
-        "platformArchABI": "linux-arm-gnu",
+        "triple": "armv7-unknown-linux-gnueabi\r",
+        "platformArchABI": "linux-arm-gnueabi\r",
         "platform": "linux",
         "arch": "arm",
-        "abi": "gnu"
+        "abi": "gnueabi\r"
       },
       {
-        "triple": "armv7-unknown-linux-gnueabihf",
-        "platformArchABI": "linux-arm-gnueabihf",
+        "triple": "armv7-unknown-linux-gnueabihf\r",
+        "platformArchABI": "linux-arm-gnueabihf\r",
         "platform": "linux",
         "arch": "arm",
-        "abi": "gnueabihf"
+        "abi": "gnueabihf\r"
       },
       {
-        "triple": "armv7-unknown-linux-musleabi",
-        "platformArchABI": "linux-arm-musl",
+        "triple": "armv7-unknown-linux-musleabi\r",
+        "platformArchABI": "linux-arm-musleabi\r",
         "platform": "linux",
         "arch": "arm",
-        "abi": "musl"
+        "abi": "musleabi\r"
       },
       {
-        "triple": "armv7-unknown-linux-musleabihf",
-        "platformArchABI": "linux-arm-musleabihf",
+        "triple": "armv7-unknown-linux-musleabihf\r",
+        "platformArchABI": "linux-arm-musleabihf\r",
         "platform": "linux",
         "arch": "arm",
-        "abi": "musleabihf"
+        "abi": "musleabihf\r"
       }
     ],
     "armv5te": [
       {
-        "triple": "armv5te-unknown-linux-gnueabi",
-        "platformArchABI": "linux-armv5te-gnu",
+        "triple": "armv5te-unknown-linux-gnueabi\r",
+        "platformArchABI": "linux-armv5te-gnueabi\r",
         "platform": "linux",
         "arch": "armv5te",
-        "abi": "gnu"
+        "abi": "gnueabi\r"
       },
       {
-        "triple": "armv5te-unknown-linux-musleabi",
-        "platformArchABI": "linux-armv5te-musl",
+        "triple": "armv5te-unknown-linux-musleabi\r",
+        "platformArchABI": "linux-armv5te-musleabi\r",
         "platform": "linux",
         "arch": "armv5te",
-        "abi": "musl"
+        "abi": "musleabi\r"
       }
     ],
     "ia32": [
       {
-        "triple": "i686-unknown-linux-gnu",
-        "platformArchABI": "linux-ia32-gnu",
+        "triple": "i686-unknown-linux-gnu\r",
+        "platformArchABI": "linux-ia32-gnu\r",
         "platform": "linux",
         "arch": "ia32",
-        "abi": "gnu"
+        "abi": "gnu\r"
       },
       {
-        "triple": "i686-unknown-linux-musl",
-        "platformArchABI": "linux-ia32-musl",
+        "triple": "i686-unknown-linux-musl\r",
+        "platformArchABI": "linux-ia32-musl\r",
         "platform": "linux",
         "arch": "ia32",
-        "abi": "musl"
+        "abi": "musl\r"
       }
     ],
     "mips": [
       {
-        "triple": "mips-unknown-linux-gnu",
-        "platformArchABI": "linux-mips-gnu",
+        "triple": "mips-unknown-linux-gnu\r",
+        "platformArchABI": "linux-mips-gnu\r",
         "platform": "linux",
         "arch": "mips",
-        "abi": "gnu"
+        "abi": "gnu\r"
       },
       {
-        "triple": "mips-unknown-linux-musl",
-        "platformArchABI": "linux-mips-musl",
+        "triple": "mips-unknown-linux-musl\r",
+        "platformArchABI": "linux-mips-musl\r",
         "platform": "linux",
         "arch": "mips",
-        "abi": "musl"
+        "abi": "musl\r"
       }
     ],
     "mips64": [
       {
-        "triple": "mips64-unknown-linux-gnuabi64",
-        "platformArchABI": "linux-mips64-gnuabi64",
+        "triple": "mips64-unknown-linux-gnuabi64\r",
+        "platformArchABI": "linux-mips64-gnuabi64\r",
         "platform": "linux",
         "arch": "mips64",
-        "abi": "gnuabi64"
+        "abi": "gnuabi64\r"
       },
       {
-        "triple": "mips64-unknown-linux-muslabi64",
-        "platformArchABI": "linux-mips64-muslabi64",
+        "triple": "mips64-unknown-linux-muslabi64\r",
+        "platformArchABI": "linux-mips64-muslabi64\r",
         "platform": "linux",
         "arch": "mips64",
-        "abi": "muslabi64"
+        "abi": "muslabi64\r"
       }
     ],
     "mips64el": [
       {
-        "triple": "mips64el-unknown-linux-gnuabi64",
-        "platformArchABI": "linux-mips64el-gnuabi64",
+        "triple": "mips64el-unknown-linux-gnuabi64\r",
+        "platformArchABI": "linux-mips64el-gnuabi64\r",
         "platform": "linux",
         "arch": "mips64el",
-        "abi": "gnuabi64"
+        "abi": "gnuabi64\r"
       },
       {
-        "triple": "mips64el-unknown-linux-muslabi64",
-        "platformArchABI": "linux-mips64el-muslabi64",
+        "triple": "mips64el-unknown-linux-muslabi64\r",
+        "platformArchABI": "linux-mips64el-muslabi64\r",
         "platform": "linux",
         "arch": "mips64el",
-        "abi": "muslabi64"
+        "abi": "muslabi64\r"
       }
     ],
     "mipsel": [
       {
-        "triple": "mipsel-unknown-linux-gnu",
-        "platformArchABI": "linux-mipsel-gnu",
+        "triple": "mipsel-unknown-linux-gnu\r",
+        "platformArchABI": "linux-mipsel-gnu\r",
         "platform": "linux",
         "arch": "mipsel",
-        "abi": "gnu"
+        "abi": "gnu\r"
       },
       {
-        "triple": "mipsel-unknown-linux-musl",
-        "platformArchABI": "linux-mipsel-musl",
+        "triple": "mipsel-unknown-linux-musl\r",
+        "platformArchABI": "linux-mipsel-musl\r",
         "platform": "linux",
         "arch": "mipsel",
-        "abi": "musl"
+        "abi": "musl\r"
       }
     ],
     "powerpc": [
       {
-        "triple": "powerpc-unknown-linux-gnu",
-        "platformArchABI": "linux-powerpc-gnu",
+        "triple": "powerpc-unknown-linux-gnu\r",
+        "platformArchABI": "linux-powerpc-gnu\r",
         "platform": "linux",
         "arch": "powerpc",
-        "abi": "gnu"
+        "abi": "gnu\r"
       }
     ],
     "powerpc64": [
       {
-        "triple": "powerpc64-unknown-linux-gnu",
-        "platformArchABI": "linux-powerpc64-gnu",
+        "triple": "powerpc64-unknown-linux-gnu\r",
+        "platformArchABI": "linux-powerpc64-gnu\r",
         "platform": "linux",
         "arch": "powerpc64",
-        "abi": "gnu"
+        "abi": "gnu\r"
       }
     ],
     "ppc64": [
       {
-        "triple": "powerpc64le-unknown-linux-gnu",
-        "platformArchABI": "linux-ppc64-gnu",
+        "triple": "powerpc64le-unknown-linux-gnu\r",
+        "platformArchABI": "linux-ppc64-gnu\r",
         "platform": "linux",
         "arch": "ppc64",
-        "abi": "gnu"
+        "abi": "gnu\r"
       }
     ],
     "riscv64": [
       {
-        "triple": "riscv64gc-unknown-linux-gnu",
-        "platformArchABI": "linux-riscv64-gnu",
+        "triple": "riscv64gc-unknown-linux-gnu\r",
+        "platformArchABI": "linux-riscv64-gnu\r",
         "platform": "linux",
         "arch": "riscv64",
-        "abi": "gnu"
+        "abi": "gnu\r"
       }
     ],
     "s390x": [
       {
-        "triple": "s390x-unknown-linux-gnu",
-        "platformArchABI": "linux-s390x-gnu",
+        "triple": "s390x-unknown-linux-gnu\r",
+        "platformArchABI": "linux-s390x-gnu\r",
         "platform": "linux",
         "arch": "s390x",
-        "abi": "gnu"
+        "abi": "gnu\r"
       }
     ],
     "sparc64": [
       {
-        "triple": "sparc64-unknown-linux-gnu",
-        "platformArchABI": "linux-sparc64-gnu",
+        "triple": "sparc64-unknown-linux-gnu\r",
+        "platformArchABI": "linux-sparc64-gnu\r",
         "platform": "linux",
         "arch": "sparc64",
-        "abi": "gnu"
+        "abi": "gnu\r"
       }
     ],
     "x64": [
       {
-        "triple": "x86_64-unknown-linux-gnu",
-        "platformArchABI": "linux-x64-gnu",
+        "triple": "x86_64-unknown-linux-gnu\r",
+        "platformArchABI": "linux-x64-gnu\r",
         "platform": "linux",
         "arch": "x64",
-        "abi": "gnu"
+        "abi": "gnu\r"
       },
       {
-        "triple": "x86_64-unknown-linux-gnux32",
-        "platformArchABI": "linux-x64-gnux32",
+        "triple": "x86_64-unknown-linux-gnux32\r",
+        "platformArchABI": "linux-x64-gnux32\r",
         "platform": "linux",
         "arch": "x64",
-        "abi": "gnux32"
+        "abi": "gnux32\r"
       },
       {
-        "triple": "x86_64-unknown-linux-musl",
-        "platformArchABI": "linux-x64-musl",
+        "triple": "x86_64-unknown-linux-musl\r",
+        "platformArchABI": "linux-x64-musl\r",
         "platform": "linux",
         "arch": "x64",
-        "abi": "musl"
-      }
-    ]
-  },
-  "freebsd": {
-    "ia32": [
-      {
-        "triple": "i686-unknown-freebsd",
-        "platformArchABI": "freebsd-ia32",
-        "platform": "freebsd",
-        "arch": "ia32",
-        "abi": null
-      }
-    ],
-    "x64": [
-      {
-        "triple": "x86_64-unknown-freebsd",
-        "platformArchABI": "freebsd-x64",
-        "platform": "freebsd",
-        "arch": "x64",
-        "abi": null
+        "abi": "musl\r"
       }
     ]
   }

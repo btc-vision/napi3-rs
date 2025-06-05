@@ -8,8 +8,6 @@ use std::slice;
 #[cfg(all(debug_assertions, not(windows)))]
 use std::sync::Mutex;
 
-#[cfg(all(feature = "napi4", not(feature = "noop")))]
-use crate::bindgen_prelude::{CUSTOM_GC_TSFN, CUSTOM_GC_TSFN_DESTROYED, THREADS_CAN_ACCESS_ENV};
 use crate::{
   bindgen_prelude::*, check_status, env::EMPTY_VEC, sys, JsValue, Result, Value, ValueType,
 };
@@ -17,6 +15,18 @@ use crate::{
 #[cfg(all(debug_assertions, not(windows)))]
 thread_local! {
   pub (crate) static BUFFER_DATA: Mutex<HashSet<*mut u8>> = Default::default();
+}
+
+#[cfg(feature = "trace-buffer-drops")]
+macro_rules! trace_drop {
+    ($($arg:tt)*) => {
+        eprintln!("[buffer-drop] {}", format_args!($($arg)*));
+    };
+}
+
+#[cfg(not(feature = "trace-buffer-drops"))]
+macro_rules! trace_drop {
+  ($($arg:tt)*) => {};
 }
 
 /// Zero copy buffer slice shared between Rust and Node.js.
@@ -38,6 +48,33 @@ impl<'env> BufferSlice<'env> {
   pub fn from_data<D: Into<Vec<u8>>>(env: &Env, data: D) -> Result<Self> {
     let mut buf = ptr::null_mut();
     let mut data = data.into();
+    let len = data.len();
+
+    // tell V8 how many bytes live outside the JS heap
+    let mut _dummy = 0;
+    check_status!(
+      unsafe { sys::napi_adjust_external_memory(env.0, len as i64, &mut _dummy) },
+      "adjust external memory"
+    )?;
+
+    /*
+     * For len == 0 V8 12.x requires the backing pointer to be NULL. We therefore
+     * ask Node to allocate an empty buffer for us instead of creating an
+     * external buffer around the dangling 0x1 pointer Rust uses.
+     */
+    if len == 0 {
+      check_status!(
+        unsafe { sys::napi_create_buffer(env.0, 0, ptr::null_mut(), &mut buf) },
+        "Failed to create zero-length BufferSlice"
+      )?;
+      mem::forget(data);
+      return Ok(Self {
+        inner: &mut [],
+        raw_value: buf,
+        env: env.0,
+      });
+    }
+
     let inner_ptr = data.as_mut_ptr();
     #[cfg(all(debug_assertions, not(windows)))]
     {
@@ -49,14 +86,16 @@ impl<'env> BufferSlice<'env> {
         panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
       }
     }
-    let len = data.len();
+
     let mut status = unsafe {
+      let cap = data.capacity();
+
       sys::napi_create_external_buffer(
         env.0,
         len,
         inner_ptr.cast(),
         Some(drop_buffer_slice),
-        Box::into_raw(Box::new(len)).cast(),
+        Box::into_raw(Box::new((len, cap))).cast(),
         &mut buf,
       )
     };
@@ -77,11 +116,7 @@ impl<'env> BufferSlice<'env> {
     check_status!(status, "Failed to create buffer slice from data")?;
 
     Ok(Self {
-      inner: if len == 0 {
-        &mut []
-      } else {
-        unsafe { slice::from_raw_parts_mut(buf.cast(), len) }
-      },
+      inner: unsafe { slice::from_raw_parts_mut(buf.cast(), len) },
       raw_value: buf,
       env: env.0,
     })
@@ -301,53 +336,92 @@ pub struct Buffer {
 
 impl Drop for Buffer {
   fn drop(&mut self) {
-    if let Some((ref_, env)) = self.raw {
-      if ref_.is_null() {
+    // Fast-path: Buffer originated from Vec<u8>
+    if self.raw.is_none() {
+      trace_drop!("from-vec len {}", self.len);
+      unsafe {
+        Vec::from_raw_parts(self.inner.as_ptr(), self.len, self.capacity);
+      }
+      return;
+    }
+
+    let (ref_, env) = self.raw.unwrap();
+    if ref_.is_null() {
+      return;
+    }
+
+    let mut ref_count = 0;
+    check_status_or_throw!(
+      env,
+      unsafe { sys::napi_reference_unref(env, ref_, &mut ref_count) },
+      "Failed to unref Buffer reference in drop",
+    );
+    trace_drop!("unref → {}  (ptr = {:?})", ref_count, ref_);
+
+    if ref_count != 0 {
+      // There are still JS/Rust handles alive; leave reference in place.
+      return;
+    }
+
+    // N-API 9+
+    #[cfg(all(feature = "napi9", not(feature = "noop")))]
+    unsafe {
+      unsafe extern "C" fn do_delete(env: sys::napi_env, data: *mut c_void, _hint: *mut c_void) {
+        let ref_ = data as sys::napi_ref;
+        let _ = sys::napi_delete_reference(env, ref_);
+      }
+
+      let status =
+        sys::node_api_post_finalizer(env.cast(), Some(do_delete), ref_.cast(), ptr::null_mut());
+      trace_drop!(
+        "queued for post-finalizer ({:?})  status={:?}",
+        ref_,
+        status
+      );
+
+      if status != sys::Status::napi_ok {
+        #[cfg(feature = "trace-buffer-drops")]
+        eprintln!(
+          "[buffer-drop] post-finalizer failed for {:?} with status {:?}",
+          ref_, status
+        );
+        std::process::abort();
+      }
+    }
+
+    // N-API ≤ 8 (old trampoline)
+    #[cfg(all(
+      not(any(feature = "napi9", feature = "napi10")),
+      any(
+        feature = "napi1",
+        feature = "napi2",
+        feature = "napi3",
+        feature = "napi4",
+        feature = "napi5",
+        feature = "napi6",
+        feature = "napi7",
+        feature = "napi8"
+      ),
+      not(feature = "noop")
+    ))]
+    {
+      if CUSTOM_GC_TSFN_DESTROYED.load(std::sync::atomic::Ordering::SeqCst) {
         return;
       }
-      // Buffer is sent to the other thread which is not the JavaScript thread
-      // This only happens with `napi4` feature enabled
-      // We send back the Buffer reference value into the `CustomGC` ThreadsafeFunction callback
-      // and destroy the reference in the thread where registered the `napi_register_module_v1`
-      #[cfg(all(feature = "napi4", not(feature = "noop")))]
-      {
-        if CUSTOM_GC_TSFN_DESTROYED.load(std::sync::atomic::Ordering::SeqCst) {
-          return;
-        }
-        // Check if the current thread is the JavaScript thread
-        if !THREADS_CAN_ACCESS_ENV.with(|cell| cell.get()) {
-          let status = unsafe {
-            sys::napi_call_threadsafe_function(
-              CUSTOM_GC_TSFN.load(std::sync::atomic::Ordering::SeqCst),
-              ref_.cast(),
-              1,
-            )
-          };
-          assert!(
-            status == sys::Status::napi_ok || status == sys::Status::napi_closing,
-            "Call custom GC in Buffer::drop failed {}",
-            Status::from(status)
-          );
-          return;
-        }
+      if !THREADS_CAN_ACCESS_ENV.with(|cell| cell.get()) {
+        let status = unsafe {
+          sys::napi_call_threadsafe_function(
+            CUSTOM_GC_TSFN.load(std::sync::atomic::Ordering::SeqCst),
+            ref_.cast(),
+            1,
+          )
+        };
+        assert!(
+          status == sys::Status::napi_ok || status == sys::Status::napi_closing,
+          "Call custom GC in Buffer::drop failed {}",
+          Status::from(status)
+        );
       }
-      let mut ref_count = 0;
-      check_status_or_throw!(
-        env,
-        unsafe { sys::napi_reference_unref(env, ref_, &mut ref_count) },
-        "Failed to unref Buffer reference in drop"
-      );
-      debug_assert!(
-        ref_count == 0,
-        "Buffer reference count in Buffer::drop is not zero"
-      );
-      check_status_or_throw!(
-        env,
-        unsafe { sys::napi_delete_reference(env, ref_) },
-        "Failed to delete Buffer reference in drop"
-      );
-    } else {
-      unsafe { Vec::from_raw_parts(self.inner.as_ptr(), self.len, self.capacity) };
     }
   }
 }
@@ -452,35 +526,29 @@ impl TypeName for Buffer {
 impl FromNapiValue for Buffer {
   unsafe fn from_napi_value(env: sys::napi_env, napi_val: sys::napi_value) -> Result<Self> {
     let mut buf = ptr::null_mut();
-    let mut len = 0;
-    let mut ref_ = ptr::null_mut();
+    let mut len = 0usize;
+
     check_status!(
-      unsafe { sys::napi_create_reference(env, napi_val, 1, &mut ref_) },
-      "Failed to create reference from Buffer"
-    )?;
-    check_status!(
-      unsafe { sys::napi_get_buffer_info(env, napi_val, &mut buf, &mut len as *mut usize) },
+      sys::napi_get_buffer_info(env, napi_val, &mut buf, &mut len),
       "Failed to get Buffer pointer and length"
     )?;
 
-    // From the docs of `napi_get_buffer_info`:
-    // > [out] data: The underlying data buffer of the node::Buffer. If length is 0, this may be
-    // > NULL or any other pointer value.
-    //
-    // In order to guarantee that `slice::from_raw_parts` is sound, the pointer must be non-null, so
-    // let's make sure it always is, even in the case of `napi_get_buffer_info` returning a null
-    // ptr.
-    let buf = NonNull::new(buf as *mut u8);
-    let inner = match buf {
-      Some(buf) if len != 0 => buf,
-      _ => NonNull::dangling(),
-    };
+    // Tell Drop that JS owns the memory
+    let mut reference = ptr::null_mut();
+    check_status!(
+      sys::napi_create_reference(env, napi_val, /*refcount*/ 1, &mut reference),
+      "Failed to create Buffer reference"
+    )?;
 
     Ok(Self {
-      inner,
+      inner: if len == 0 {
+        NonNull::dangling()
+      } else {
+        NonNull::new_unchecked(buf.cast())
+      },
       len,
       capacity: len,
-      raw: Some((ref_, env)),
+      raw: Some((reference, env)),
     })
   }
 }

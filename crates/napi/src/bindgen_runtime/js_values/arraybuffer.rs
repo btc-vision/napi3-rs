@@ -3,11 +3,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
-#[cfg(all(feature = "napi4", not(feature = "noop")))]
-use std::sync::atomic::Ordering;
 
-#[cfg(all(feature = "napi4", not(feature = "noop")))]
-use crate::bindgen_prelude::{CUSTOM_GC_TSFN, CUSTOM_GC_TSFN_DESTROYED, THREADS_CAN_ACCESS_ENV};
 use crate::{
   bindgen_prelude::{
     FromNapiValue, JsObjectValue, JsValue, This, ToNapiValue, TypeName, ValidateNapiValue,
@@ -35,6 +31,11 @@ pub enum TypedArrayType {
 
   /// compatible with higher versions
   Unknown = 1024,
+}
+
+thread_local! {
+    pub(crate) static IN_FINALISER: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
 }
 
 impl AsRef<str> for TypedArrayType {
@@ -159,13 +160,23 @@ impl<'env> ArrayBuffer<'env> {
       }
     }
     let len = data.len();
+
+    // tell V8 how many bytes live outside the JS heap
+    let mut _dummy = 0;
+    check_status!(
+      unsafe { sys::napi_adjust_external_memory(env.0, len as i64, &mut _dummy) },
+      "adjust external memory"
+    )?;
+
     let mut status = unsafe {
+      let cap = data.capacity();
+
       sys::napi_create_external_arraybuffer(
         env.0,
         inner_ptr.cast(),
         data.len(),
         Some(finalize_slice::<u8>),
-        Box::into_raw(Box::new(len)).cast(),
+        Box::into_raw(Box::new((len, cap))).cast(),
         &mut buf,
       )
     };
@@ -330,6 +341,8 @@ trait Finalizer {
   type RustType;
 
   fn finalizer_notify(&self) -> *mut dyn FnOnce(*mut Self::RustType, usize);
+
+  fn byte_len(&self) -> usize;
 }
 
 macro_rules! impl_typed_array {
@@ -341,11 +354,14 @@ macro_rules! impl_typed_array {
       byte_offset: usize,
       raw: Option<(crate::sys::napi_ref, crate::sys::napi_env)>,
       finalizer_notify: *mut dyn FnOnce(*mut $rust_type, usize),
+      owned_by_rust: bool,
     }
 
     /// SAFETY: This is undefined behavior, as the JS side may always modify the underlying buffer,
     /// without synchronization. Also see the docs for the `DerfMut` impl.
+    #[cfg(feature = "unsafe_send_sync")]
     unsafe impl Send for $name {}
+    #[cfg(feature = "unsafe_send_sync")]
     unsafe impl Sync for $name {}
 
     impl Finalizer for $name {
@@ -354,63 +370,57 @@ macro_rules! impl_typed_array {
       fn finalizer_notify(&self) -> *mut dyn FnOnce(*mut Self::RustType, usize) {
         self.finalizer_notify
       }
+
+      fn byte_len(&self) -> usize {
+        self.length * std::mem::size_of::<$rust_type>()
+      }
     }
 
     impl Drop for $name {
       fn drop(&mut self) {
-        if let Some((ref_, env)) = self.raw {
-          // If the ref is null, it means the TypedArray has been called `ToNapiValue::to_napi_value`, and the `ref` has been deleted
-          // If the env is null, it means the TypedArray is copied in `&mut TypedArray ToNapiValue::to_napi_value`, and the `ref` will be deleted in the raw TypedArray
-          if ref_.is_null() || env.is_null() {
-            return;
+        /* ------------------------------------------
+         *  A. Native data path (no napi_ref stored)
+         * -----------------------------------------*/
+        if self.raw.is_none() {
+          /* Only free if the buffer originated from Rust.              */
+          if self.owned_by_rust && !self.data.is_null() {
+            let len = self.length;
+            unsafe { Vec::from_raw_parts(self.data, len, len) };
           }
-          #[cfg(all(feature = "napi4", not(feature = "noop")))]
-          {
-            if CUSTOM_GC_TSFN_DESTROYED.load(Ordering::SeqCst) {
-              return;
-            }
-            if !THREADS_CAN_ACCESS_ENV.with(|cell| cell.get()) {
-              let status = unsafe {
-                sys::napi_call_threadsafe_function(
-                  CUSTOM_GC_TSFN.load(std::sync::atomic::Ordering::SeqCst),
-                  ref_.cast(),
-                  1,
-                )
-              };
-              assert!(
-                status == sys::Status::napi_ok || status == sys::Status::napi_closing,
-                "Call custom GC in ArrayBuffer::drop failed {}",
-                Status::from(status)
-              );
-              return;
-            }
-          }
-          let mut ref_count = 0;
-          crate::check_status_or_throw!(
-            env,
-            unsafe { sys::napi_reference_unref(env, ref_, &mut ref_count) },
-            "Failed to unref ArrayBuffer reference in drop"
-          );
-          debug_assert!(
-            ref_count == 0,
-            "ArrayBuffer reference count in ArrayBuffer::drop is not zero"
-          );
-          crate::check_status_or_throw!(
-            env,
-            unsafe { sys::napi_delete_reference(env, ref_) },
-            "Failed to delete ArrayBuffer reference in drop"
-          );
+        }
+
+        /* ------------------------------------------
+         *  B. We kept a napi_ref – release it,
+         *     unless we are inside the finaliser.
+         * -----------------------------------------*/
+        let Some((reference, env)) = self.raw else {
+          return;
+        };
+
+        // A copy created by `to_napi_value(&mut self)` shares the reference
+        // but stores `env = null_mut()`.  Let the original clean up.
+        if env.is_null() {
           return;
         }
-        if !self.data.is_null() {
-          let length = self.length;
-          unsafe { Vec::from_raw_parts(self.data, length, length) };
+
+        // Inside a GC finaliser we must NOT touch N-API.
+        if crate::bindgen_runtime::IN_FINALISER.with(|f| f.get()) {
+          // Leak the reference safely; Node will reclaim it on env teardown.
           return;
         }
-        if !self.finalizer_notify().is_null() {
-          let finalizer = unsafe { Box::from_raw(self.finalizer_notify) };
-          (finalizer)(self.data, self.length);
-        }
+
+        let mut ref_count = 0;
+        crate::check_status_or_throw!(
+          env,
+          unsafe { sys::napi_reference_unref(env, reference, &mut ref_count) },
+          "Failed to unref TypedArray"
+        );
+        debug_assert!(ref_count == 0, "TypedArray ref count not zero");
+        crate::check_status_or_throw!(
+          env,
+          unsafe { sys::napi_delete_reference(env, reference) },
+          "Failed to delete TypedArray reference"
+        );
       }
     }
 
@@ -466,6 +476,7 @@ macro_rules! impl_typed_array {
           byte_offset: 0,
           raw: None,
           finalizer_notify: ptr::null_mut::<fn(*mut $rust_type, usize)>(),
+          owned_by_rust: true,
         };
         mem::forget(data);
         ret
@@ -480,6 +491,7 @@ macro_rules! impl_typed_array {
           data: data_copied.as_mut_ptr(),
           length: data.as_ref().len(),
           finalizer_notify: ptr::null_mut::<fn(*mut $rust_type, usize)>(),
+          owned_by_rust: true,
           raw: None,
           byte_offset: 0,
         };
@@ -499,6 +511,7 @@ macro_rules! impl_typed_array {
           length,
           finalizer_notify: Box::into_raw(Box::new(notify)),
           raw: None,
+          owned_by_rust: true,
           byte_offset: 0,
         }
       }
@@ -571,11 +584,7 @@ macro_rules! impl_typed_array {
         let mut data = ptr::null_mut();
         let mut array_buffer = ptr::null_mut();
         let mut byte_offset = 0;
-        let mut ref_ = ptr::null_mut();
-        check_status!(
-          unsafe { sys::napi_create_reference(env, napi_val, 1, &mut ref_) },
-          "Failed to create reference from Buffer"
-        )?;
+
         check_status!(
           unsafe {
             sys::napi_get_typedarray_info(
@@ -604,7 +613,8 @@ macro_rules! impl_typed_array {
           data: data.cast(),
           length,
           byte_offset,
-          raw: Some((ref_, env)),
+          raw: None,
+          owned_by_rust: false,
           finalizer_notify: ptr::null_mut::<fn(*mut $rust_type, usize)>(),
         })
       }
@@ -719,6 +729,7 @@ macro_rules! impl_typed_array {
               length: val.length,
               byte_offset: val.byte_offset,
               raw: None,
+              owned_by_rust: true,
               finalizer_notify: val.finalizer_notify,
             };
             let hint_ref: &mut $name = Box::leak(Box::new(val_copy));
@@ -767,17 +778,16 @@ macro_rules! impl_typed_array {
           },
           "Create TypedArray failed"
         )?;
-        let mut ref_ = ptr::null_mut();
-        check_status!(
-          unsafe { sys::napi_create_reference(env, napi_val, 1, &mut ref_) },
-          "Failed to delete reference in ArrayBuffer::to_napi_value"
-        )?;
-        val.raw = Some((ref_, env));
+
+        val.raw = None;
+        val.owned_by_rust = false;
+
         if let Some(copied_val) = copied_val {
+          // we no longer keep a napi_ref, so the clone carries `None`
           val.finalizer_notify = ptr::null_mut::<fn(*mut $rust_type, usize)>();
           val.data = ptr::null_mut();
           val.length = 0;
-          copied_val.raw = Some((ref_, ptr::null_mut()));
+          copied_val.raw = None;
         }
         Ok(napi_val)
       }
@@ -817,13 +827,22 @@ macro_rules! impl_from_slice {
           }
         }
         let len = data.len();
+        // tell V8 how many bytes live outside the JS heap
+        let mut _dummy = 0;
+        check_status!(
+            unsafe { sys::napi_adjust_external_memory(env.0, len as i64, &mut _dummy) },
+            "adjust external memory"
+        )?;
+
         let mut status = unsafe {
+          let cap = data.capacity();
+
           sys::napi_create_external_arraybuffer(
             env.0,
             inner_ptr.cast(),
             data.len(),
             Some(finalize_slice::<$rust_type>),
-            Box::into_raw(Box::new(len)).cast(),
+            Box::into_raw(Box::new((len, cap))).cast(),
             &mut buf,
           )
         };
@@ -1312,13 +1331,22 @@ macro_rules! impl_from_slice {
   };
 }
 
-unsafe extern "C" fn finalizer<Data, T: Finalizer<RustType = Data> + AsRef<[Data]>>(
+unsafe extern "C" fn finalizer<Data, T: Finalizer<RustType = Data>>(
   _env: sys::napi_env,
   _finalize_data: *mut c_void,
   finalize_hint: *mut c_void,
 ) {
-  let data = unsafe { *Box::from_raw(finalize_hint as *mut T) };
+  crate::bindgen_runtime::IN_FINALISER.with(|f| f.set(true));
+
+  let data: T = *Box::from_raw(finalize_hint.cast::<T>());
+
+  if !_env.is_null() {
+    let mut _dummy = 0;
+    sys::napi_adjust_external_memory(_env, -(data.byte_len() as i64), &mut _dummy);
+  }
+
   drop(data);
+  crate::bindgen_runtime::IN_FINALISER.with(|f| f.set(false));
 }
 
 unsafe extern "C" fn finalize_slice<Data>(
@@ -1326,8 +1354,12 @@ unsafe extern "C" fn finalize_slice<Data>(
   finalize_data: *mut c_void,
   finalize_hint: *mut c_void,
 ) {
-  let length = unsafe { *Box::from_raw(finalize_hint as *mut usize) };
-  unsafe { Vec::from_raw_parts(finalize_data as *mut Data, length, length) };
+  let (length, cap) = *Box::from_raw(finalize_hint as *mut (usize, usize));
+  Vec::from_raw_parts(finalize_data as *mut Data, length, cap);
+
+  // balance external-memory counter
+  let mut _dummy = 0;
+  sys::napi_adjust_external_memory(_env, -(length as i64), &mut _dummy);
 }
 
 impl_typed_array!(Int8Array, i8, TypedArrayType::Int8);
@@ -1380,11 +1412,13 @@ impl Uint8Array {
   /// Create a new JavaScript `Uint8Array` from a Rust `String` without copying the underlying data.
   pub fn from_string(mut s: String) -> Self {
     let len = s.len();
+    let cap = s.capacity();
     let ret = Self {
       data: s.as_mut_ptr(),
       length: len,
+      owned_by_rust: true,
       finalizer_notify: Box::into_raw(Box::new(move |data, _| {
-        drop(unsafe { String::from_raw_parts(data, len, len) });
+        drop(unsafe { String::from_raw_parts(data, len, cap) });
       })),
       byte_offset: 0,
       raw: None,
@@ -1523,13 +1557,22 @@ impl<'env> Uint8ClampedSlice<'env> {
       }
     }
     let len = data.len();
+    // tell V8 how many bytes live outside the JS heap
+    let mut _dummy = 0;
+    check_status!(
+      unsafe { sys::napi_adjust_external_memory(env.0, len as i64, &mut _dummy) },
+      "adjust external memory"
+    )?;
+
     let mut status = unsafe {
+      let cap = data.capacity();
+
       sys::napi_create_external_arraybuffer(
         env.0,
         inner_ptr.cast(),
         data.len(),
         Some(finalize_slice::<u8>),
-        Box::into_raw(Box::new(len)).cast(),
+        Box::into_raw(Box::new((len, cap))).cast(),
         &mut buf,
       )
     };

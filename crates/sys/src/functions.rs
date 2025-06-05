@@ -700,9 +700,8 @@ mod napi8 {
 
 #[cfg(feature = "napi9")]
 mod napi9 {
-  use std::os::raw::c_char;
-
   use super::super::types::*;
+  use std::os::raw::{c_char, c_void};
 
   generate!(
     extern "C" {
@@ -712,17 +711,27 @@ mod napi9 {
         length: isize,
         result: *mut napi_value,
       ) -> napi_status;
+
       fn node_api_get_module_file_name(env: napi_env, result: *mut *const c_char) -> napi_status;
+
       fn node_api_create_syntax_error(
         env: napi_env,
         code: napi_value,
         msg: napi_value,
         result: *mut napi_value,
       ) -> napi_status;
+
       fn node_api_throw_syntax_error(
         env: napi_env,
         code: *const c_char,
         msg: *const c_char,
+      ) -> napi_status;
+
+      fn node_api_post_finalizer(
+        env: node_api_basic_env,
+        finalize_cb: napi_finalize,
+        finalize_data: *mut c_void,
+        finalize_hint: *mut c_void,
       ) -> napi_status;
     }
   );
@@ -782,8 +791,6 @@ mod napi10 {
 
 #[cfg(feature = "experimental")]
 mod experimental {
-  use std::os::raw::c_void;
-
   use super::super::types::*;
 
   generate!(
@@ -794,13 +801,6 @@ mod experimental {
         byte_offset: usize,
         byte_length: usize,
         result: *mut napi_value,
-      ) -> napi_status;
-
-      fn node_api_post_finalizer(
-        env: node_api_basic_env,
-        finalize_cb: napi_finalize,
-        finalize_data: *mut c_void,
-        finalize_hint: *mut c_void,
       ) -> napi_status;
     }
   );

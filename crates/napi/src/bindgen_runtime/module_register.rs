@@ -638,6 +638,8 @@ unsafe extern "C" fn thread_cleanup(
     #[allow(clippy::needless_return)]
     return;
   }
+
+  THREADS_CAN_ACCESS_ENV.with(|c| c.set(false));
 }
 
 #[cfg(all(feature = "napi4", not(feature = "noop")))]
@@ -657,8 +659,24 @@ unsafe extern "C" fn custom_gc_finalize(
 }
 
 #[cfg(all(feature = "napi4", not(feature = "noop")))]
-// recycle the ArrayBuffer/Buffer Reference if the ArrayBuffer/Buffer is not dropped on the main thread
 extern "C" fn custom_gc(
+  env: sys::napi_env,
+  _js_callback: sys::napi_value,
+  _context: *mut std::ffi::c_void,
+  data: *mut std::ffi::c_void,
+) {
+  // wrong thread, TSFN already destroyed, or null payload → nothing to do
+  if THREADS_CAN_ACCESS_ENV.with(|c| !c.get()) || data.is_null() {
+    return;
+  }
+
+  // hand control back to N-API’s own TrackedFinalizer:
+  let _ = unsafe { sys::napi_reference_unref(env, data.cast(), std::ptr::null_mut()) };
+}
+
+//#[cfg(all(feature = "napi4", not(feature = "noop")))]
+// recycle the ArrayBuffer/Buffer Reference if the ArrayBuffer/Buffer is not dropped on the main thread
+/*extern "C" fn custom_gc(
   env: sys::napi_env,
   _js_callback: sys::napi_value,
   _context: *mut std::ffi::c_void,
@@ -683,4 +701,4 @@ extern "C" fn custom_gc(
     unsafe { sys::napi_delete_reference(env, data.cast()) },
     "Failed to delete Buffer reference in Custom GC"
   );
-}
+}*/
