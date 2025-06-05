@@ -26,14 +26,23 @@ fn get_empty_buffer() -> Buffer {
 
 #[napi]
 pub fn create_external_buffer_slice(env: &Env) -> Result<BufferSlice> {
-  let mut data = String::from("Hello world").as_bytes().to_vec();
-  let data_ptr = data.as_mut_ptr();
+  let mut data = b"Hello world".to_vec();
   let len = data.len();
-  // Mock the ffi data that not managed by Rust
+  let data_ptr = data.as_mut_ptr();
+
+  // The Arc flag prevents double-free
+  let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+  let flag = alive.clone();
+
+  // Leak the Vec – JS now owns it
   std::mem::forget(data);
+
   unsafe {
-    BufferSlice::from_external(env, data_ptr, len, data_ptr, move |_, ptr| {
-      std::mem::drop(Vec::from_raw_parts(ptr, len, len));
+    BufferSlice::from_external(env, data_ptr, len, flag, |_, flag| {
+      // This runs in V8’s GC thread
+      if flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        drop(Vec::from_raw_parts(data_ptr, len, len));
+      }
     })
   }
 }

@@ -1378,6 +1378,10 @@ unsafe extern "C" fn finalizer<Data, T: Finalizer<RustType = Data>>(
   _finalize_data: *mut c_void,
   finalize_hint: *mut c_void,
 ) {
+  if finalize_hint.is_null() {
+    return;
+  }
+
   crate::bindgen_runtime::IN_FINALISER.with(|f| f.set(true));
 
   let data: T = *Box::from_raw(finalize_hint.cast::<T>());
@@ -1397,6 +1401,10 @@ unsafe extern "C" fn finalize_slice<Data>(
   finalize_data: *mut c_void,
   finalize_hint: *mut c_void,
 ) {
+  if finalize_data.is_null() {
+    return;
+  }
+
   #[cfg(all(debug_assertions, not(windows)))]
   unregister_backing_ptr(finalize_data as *mut u8);
 

@@ -75,70 +75,60 @@ impl<'env> BufferSlice<'env> {
   ///
   /// While this is still a fully-supported data structure, in most cases using a `Uint8Array` will suffice.
   pub fn from_data<D: Into<Vec<u8>>>(env: &Env, data: D) -> Result<Self> {
-    let mut buf = ptr::null_mut();
-    let mut data = data.into();
-    let len = data.len();
+    let mut js_value = ptr::null_mut();
+    let mut vec = data.into();
+    let len = vec.len();
 
-    // tell V8 how many bytes live outside the JS heap
     let mut _dummy = 0;
     check_status!(
       unsafe { sys::napi_adjust_external_memory(env.0, len as i64, &mut _dummy) },
       "adjust external memory"
     )?;
 
-    /*
-     * For len == 0 V8 12.x requires the backing pointer to be NULL. We therefore
-     * ask Node to allocate an empty buffer for us instead of creating an
-     * external buffer around the dangling 0x1 pointer Rust uses.
-     */
     if len == 0 {
       check_status!(
-        unsafe { sys::napi_create_buffer(env.0, 0, ptr::null_mut(), &mut buf) },
+        unsafe { sys::napi_create_buffer(env.0, 0, ptr::null_mut(), &mut js_value) },
         "Failed to create zero-length BufferSlice"
       )?;
-      mem::forget(data);
+      mem::forget(vec);
       return Ok(Self {
         inner: &mut [],
-        raw_value: buf,
+        raw_value: js_value,
         env: env.0,
       });
     }
 
-    let inner_ptr = data.as_mut_ptr();
-    #[cfg(all(debug_assertions, not(windows)))]
-    register_backing_ptr(inner_ptr);
-
+    let src_ptr = vec.as_mut_ptr();
     let mut status = unsafe {
-      let cap = data.capacity();
-
       sys::napi_create_external_buffer(
         env.0,
         len,
-        inner_ptr.cast(),
+        src_ptr.cast(),
         Some(drop_buffer_slice),
-        Box::into_raw(Box::new((len, cap))).cast(),
-        &mut buf,
+        Box::into_raw(Box::new((len, vec.capacity()))).cast(),
+        &mut js_value,
       )
     };
-    status = if status == sys::Status::napi_no_external_buffers_allowed {
-      unsafe {
-        sys::napi_create_buffer_copy(
-          env.0,
-          len,
-          data.as_mut_ptr().cast(),
-          ptr::null_mut(),
-          &mut buf,
-        )
-      }
-    } else {
-      status
-    };
-    mem::forget(data);
-    check_status!(status, "Failed to create buffer slice from data")?;
+
+    let mut backing_ptr: *mut c_void = src_ptr.cast();
+
+    if status == sys::Status::napi_no_external_buffers_allowed {
+      let mut copy_ptr: *mut c_void = ptr::null_mut();
+      status = unsafe {
+        sys::napi_create_buffer_copy(env.0, len, src_ptr.cast(), &mut copy_ptr, &mut js_value)
+      };
+      backing_ptr = copy_ptr;
+    }
+
+    mem::forget(vec);
+    check_status!(status, "Failed to create BufferSlice")?;
+
+    #[cfg(all(debug_assertions, not(windows)))]
+    register_backing_ptr(backing_ptr.cast::<u8>());
 
     Ok(Self {
-      inner: unsafe { slice::from_raw_parts_mut(buf.cast(), len) },
-      raw_value: buf,
+      inner: unsafe { slice::from_raw_parts_mut(backing_ptr.cast::<u8>(), len) },
+      raw_value: js_value,
       env: env.0,
     })
   }
@@ -166,42 +156,50 @@ impl<'env> BufferSlice<'env> {
     finalize_hint: T,
     finalize_callback: F,
   ) -> Result<Self> {
-    let mut buf = ptr::null_mut();
     if data.is_null() || std::ptr::eq(data, EMPTY_VEC.as_ptr()) {
       return Err(Error::new(
         Status::InvalidArg,
         "Borrowed data should not be null".to_owned(),
       ));
     }
-    #[cfg(all(debug_assertions, not(windows)))]
-    register_backing_ptr(data);
+
+    // fast path: external buffer
+    let mut buf = ptr::null_mut();
     let hint_ptr = Box::into_raw(Box::new((finalize_hint, finalize_callback)));
-    let mut status = unsafe {
-      sys::napi_create_external_buffer(
-        env.0,
-        len,
-        data.cast(),
-        Some(crate::env::raw_finalize_with_custom_callback::<T, F>),
-        hint_ptr.cast(),
-        &mut buf,
-      )
-    };
-    status = if status == sys::Status::napi_no_external_buffers_allowed {
+    let mut status = sys::napi_create_external_buffer(
+      env.0,
+      len,
+      data.cast(),
+      Some(crate::env::raw_finalize_with_custom_callback::<T, F>),
+      hint_ptr.cast(),
+      &mut buf,
+    );
+
+    let mut copied_ptr: *mut c_void = ptr::null_mut();
+
+    if status == sys::Status::napi_no_external_buffers_allowed {
       let (hint, finalize) = *Box::from_raw(hint_ptr);
-      let status =
-        unsafe { sys::napi_create_buffer_copy(env.0, len, data.cast(), ptr::null_mut(), &mut buf) };
+      status = sys::napi_create_buffer_copy(env.0, len, data.cast(), &mut copied_ptr, &mut buf);
       finalize(*env, hint);
-      status
-    } else {
-      status
-    };
+    }
+
     check_status!(status, "Failed to create buffer slice from data")?;
+
+    #[cfg(all(debug_assertions, not(windows)))]
+    {
+      let ptr_to_track: *mut u8 = if status == sys::Status::napi_no_external_buffers_allowed {
+        copied_ptr.cast() // new backing store from buffer-copy
+      } else {
+        data // original external buffer pointer
+      };
+      register_backing_ptr(ptr_to_track);
+    }
 
     Ok(Self {
       inner: if len == 0 {
         &mut []
       } else {
-        unsafe { slice::from_raw_parts_mut(buf.cast(), len) }
+        slice::from_raw_parts_mut(buf.cast(), len)
       },
       raw_value: buf,
       env: env.0,
@@ -210,24 +208,35 @@ impl<'env> BufferSlice<'env> {
 
   /// Copy data from a `&[u8]` and create a `BufferSlice` from it.
   pub fn copy_from<D: AsRef<[u8]>>(env: &Env, data: D) -> Result<Self> {
-    let data = data.as_ref();
-    let len = data.len();
-    let data_ptr = data.as_ptr();
-    let mut buf = ptr::null_mut();
-    let mut result_ptr = ptr::null_mut();
+    let bytes = data.as_ref();
+    let len = bytes.len();
+
+    // `result_ptr` will be the real backing-store pointer V8 owns.
+    let mut js_value = ptr::null_mut(); // the Buffer object returned
+    let mut result_ptr = ptr::null_mut(); // raw memory inside that Buffer
     check_status!(
       unsafe {
-        sys::napi_create_buffer_copy(env.0, len, data_ptr.cast(), &mut result_ptr, &mut buf)
+        sys::napi_create_buffer_copy(
+          env.0,
+          len,
+          bytes.as_ptr().cast(),
+          &mut result_ptr,
+          &mut js_value,
+        )
       },
-      "Faild to create a buffer from copied data"
+      "Failed to create BufferSlice from copied data"
     )?;
+
+    let slice: &mut [u8] = if len == 0 {
+      &mut []
+    } else {
+      // SAFETY: `result_ptr` points to the freshly-allocated Buffer memory
+      unsafe { slice::from_raw_parts_mut(result_ptr.cast::<u8>(), len) }
+    };
+
     Ok(Self {
-      inner: if len == 0 {
-        &mut []
-      } else {
-        unsafe { slice::from_raw_parts_mut(buf.cast(), len) }
-      },
-      raw_value: buf,
+      inner: slice,
+      raw_value: js_value,
       env: env.0,
     })
   }
@@ -383,6 +392,11 @@ impl Drop for Buffer {
       unsafe extern "C" fn do_delete(env: sys::napi_env, data: *mut c_void, _hint: *mut c_void) {
         let ref_ = data as sys::napi_ref;
         let _ = sys::napi_delete_reference(env, ref_);
+      }
+
+      // N-API 9+: don't touch the env when we're already outside its lifetime
+      if THREADS_CAN_ACCESS_ENV.with(|c| !c.get()) {
+        return;
       }
 
       let status =
