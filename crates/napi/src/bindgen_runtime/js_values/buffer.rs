@@ -17,6 +17,35 @@ thread_local! {
   pub (crate) static BUFFER_DATA: Mutex<HashSet<*mut u8>> = Default::default();
 }
 
+#[cfg(all(debug_assertions, not(windows)))]
+#[inline]
+pub fn register_backing_ptr(ptr: *mut u8) {
+  if ptr.is_null() {
+    return;
+  } // 0-length buffers use NULL
+  BUFFER_DATA.with(|buffer_data| {
+    let mut set = buffer_data.lock().unwrap();
+    if !set.insert(ptr) {
+      panic!(
+        "Share the same data between different buffers is not allowed, \
+                    see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747"
+      );
+    }
+  });
+}
+
+#[cfg(all(debug_assertions, not(windows)))]
+#[inline]
+pub fn unregister_backing_ptr(ptr: *mut u8) {
+  if ptr.is_null() {
+    return;
+  }
+  BUFFER_DATA.with(|buffer_data| {
+    let mut set = buffer_data.lock().unwrap();
+    set.remove(&ptr);
+  });
+}
+
 #[cfg(feature = "trace-buffer-drops")]
 macro_rules! trace_drop {
     ($($arg:tt)*) => {
@@ -77,15 +106,7 @@ impl<'env> BufferSlice<'env> {
 
     let inner_ptr = data.as_mut_ptr();
     #[cfg(all(debug_assertions, not(windows)))]
-    {
-      let is_existed = BUFFER_DATA.with(|buffer_data| {
-        let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-        buffer.contains(&inner_ptr)
-      });
-      if is_existed {
-        panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-      }
-    }
+    register_backing_ptr(inner_ptr);
 
     let mut status = unsafe {
       let cap = data.capacity();
@@ -153,15 +174,7 @@ impl<'env> BufferSlice<'env> {
       ));
     }
     #[cfg(all(debug_assertions, not(windows)))]
-    {
-      let is_existed = BUFFER_DATA.with(|buffer_data| {
-        let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-        buffer.contains(&data)
-      });
-      if is_existed {
-        panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-      }
-    }
+    register_backing_ptr(data);
     let hint_ptr = Box::into_raw(Box::new((finalize_hint, finalize_callback)));
     let mut status = unsafe {
       sys::napi_create_external_buffer(
@@ -332,12 +345,13 @@ pub struct Buffer {
   pub(crate) len: usize,
   pub(crate) capacity: usize,
   raw: Option<(sys::napi_ref, sys::napi_env)>,
+  owned_by_rust: bool,
 }
 
 impl Drop for Buffer {
   fn drop(&mut self) {
     // Fast-path: Buffer originated from Vec<u8>
-    if self.raw.is_none() {
+    if self.raw.is_none() && self.owned_by_rust {
       trace_drop!("from-vec len {}", self.len);
       unsafe {
         Vec::from_raw_parts(self.inner.as_ptr(), self.len, self.capacity);
@@ -441,15 +455,7 @@ impl From<Vec<u8>> for Buffer {
   fn from(mut data: Vec<u8>) -> Self {
     let inner_ptr = data.as_mut_ptr();
     #[cfg(all(debug_assertions, not(windows)))]
-    {
-      let is_existed = BUFFER_DATA.with(|buffer_data| {
-        let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-        buffer.contains(&inner_ptr)
-      });
-      if is_existed {
-        panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-      }
-    }
+    register_backing_ptr(inner_ptr);
     let len = data.len();
     let capacity = data.capacity();
     mem::forget(data);
@@ -461,6 +467,7 @@ impl From<Vec<u8>> for Buffer {
       len,
       capacity,
       raw: None,
+      owned_by_rust: true,
     }
   }
 }
@@ -549,6 +556,7 @@ impl FromNapiValue for Buffer {
       len,
       capacity: len,
       raw: Some((reference, env)),
+      owned_by_rust: false,
     })
   }
 }
@@ -581,6 +589,8 @@ impl ToNapiValue for Buffer {
       } else {
         let value_ptr = val.inner.as_ptr();
         let val_box_ptr = Box::into_raw(Box::new(val));
+        // Rust no longer owns the bytes – finaliser will free them
+        (*(val_box_ptr)).owned_by_rust = false;
         let mut status = unsafe {
           sys::napi_create_external_buffer(
             env,

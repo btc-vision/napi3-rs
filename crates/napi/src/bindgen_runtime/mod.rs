@@ -103,12 +103,7 @@ pub unsafe extern "C" fn drop_buffer_slice(
 ) {
   let len = *unsafe { Box::from_raw(finalize_hint.cast()) };
   #[cfg(all(debug_assertions, not(windows)))]
-  {
-    js_values::BUFFER_DATA.with(|buffer_data| {
-      let mut buffer = buffer_data.lock().expect("Unlock Buffer data failed");
-      buffer.remove(&(finalize_data as *mut u8));
-    });
-  }
+  unregister_backing_ptr(finalize_data as *mut u8);
   unsafe {
     drop(Vec::from_raw_parts(finalize_data, len, len));
   }

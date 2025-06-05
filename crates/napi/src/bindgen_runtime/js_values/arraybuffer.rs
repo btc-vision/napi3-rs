@@ -1,9 +1,11 @@
 use std::ffi::{c_void, CString};
 use std::marker::PhantomData;
-use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
+use std::{mem, slice};
 
+#[cfg(all(debug_assertions, not(windows)))]
+use crate::bindgen_prelude::{register_backing_ptr, unregister_backing_ptr};
 use crate::{
   bindgen_prelude::{
     FromNapiValue, JsObjectValue, JsValue, This, ToNapiValue, TypeName, ValidateNapiValue,
@@ -149,19 +151,9 @@ impl<'env> ArrayBuffer<'env> {
     let mut buf = ptr::null_mut();
     let mut data = data.into();
     let mut inner_ptr = data.as_mut_ptr();
-    #[cfg(all(debug_assertions, not(windows)))]
-    {
-      let is_existed = super::BUFFER_DATA.with(|buffer_data| {
-        let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-        buffer.contains(&inner_ptr)
-      });
-      if is_existed {
-        panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-      }
-    }
     let len = data.len();
 
-    // tell V8 how many bytes live outside the JS heap
+    // Tell V8 how many bytes live outside the JS heap
     let mut _dummy = 0;
     check_status!(
       unsafe { sys::napi_adjust_external_memory(env.0, len as i64, &mut _dummy) },
@@ -170,29 +162,34 @@ impl<'env> ArrayBuffer<'env> {
 
     let mut status = unsafe {
       let cap = data.capacity();
-
       sys::napi_create_external_arraybuffer(
         env.0,
         inner_ptr.cast(),
-        data.len(),
+        len,
         Some(finalize_slice::<u8>),
         Box::into_raw(Box::new((len, cap))).cast(),
         &mut buf,
       )
     };
+
     if status == napi_sys::Status::napi_no_external_buffers_allowed {
-      let mut inner_data = unsafe { Vec::from_raw_parts(inner_ptr, data.len(), data.len()) };
+      let mut inner_data = unsafe { Vec::from_raw_parts(inner_ptr, len, len) };
       let mut underlying_data = ptr::null_mut();
-      status =
-        unsafe { sys::napi_create_arraybuffer(env.0, data.len(), &mut underlying_data, &mut buf) };
+      status = unsafe { sys::napi_create_arraybuffer(env.0, len, &mut underlying_data, &mut buf) };
       unsafe {
-        std::ptr::copy_nonoverlapping(inner_data.as_mut_ptr().cast(), underlying_data, data.len())
-      };
-      inner_ptr = underlying_data.cast();
+        ptr::copy_nonoverlapping(inner_data.as_mut_ptr(), underlying_data.cast(), len);
+      }
+      inner_ptr = underlying_data.cast(); // <- this is the real backing store now
     } else {
-      mem::forget(data);
+      mem::forget(data); // JS owns the original Vec’s memory
     }
     check_status!(status, "Failed to create buffer slice from data")?;
+
+    #[cfg(all(debug_assertions, not(windows)))]
+    if len != 0 {
+      register_backing_ptr(inner_ptr);
+    }
+
     Ok(Self {
       value: Value {
         env: env.0,
@@ -202,7 +199,7 @@ impl<'env> ArrayBuffer<'env> {
       data: if len == 0 {
         &[]
       } else {
-        unsafe { std::slice::from_raw_parts(inner_ptr.cast(), len) }
+        unsafe { slice::from_raw_parts(inner_ptr.cast(), len) }
       },
     })
   }
@@ -236,18 +233,13 @@ impl<'env> ArrayBuffer<'env> {
         "Borrowed data should not be null".to_owned(),
       ));
     }
-    #[cfg(all(debug_assertions, not(windows)))]
-    {
-      let is_existed = super::BUFFER_DATA.with(|buffer_data| {
-        let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-        buffer.contains(&data)
-      });
-      if is_existed {
-        panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-      }
-    }
+
+    // Will hold a new buffer if the Electron fallback is taken.
+    let mut underlying_data: *mut c_void = ptr::null_mut();
+
     let hint_ptr = Box::into_raw(Box::new((finalize_hint, finalize_callback)));
     let mut arraybuffer_value = ptr::null_mut();
+
     let mut status = unsafe {
       sys::napi_create_external_arraybuffer(
         env.0,
@@ -258,19 +250,34 @@ impl<'env> ArrayBuffer<'env> {
         &mut arraybuffer_value,
       )
     };
-    status = if status == sys::Status::napi_no_external_buffers_allowed {
+
+    if status == sys::Status::napi_no_external_buffers_allowed {
       let (hint, finalize) = *Box::from_raw(hint_ptr);
-      let mut underlying_data = ptr::null_mut();
-      let status = unsafe {
-        sys::napi_create_arraybuffer(env.0, len, &mut underlying_data, &mut arraybuffer_value)
+      status = unsafe {
+        sys::napi_create_arraybuffer(
+          env.0,
+          len,
+          &mut underlying_data, // now has the expected type
+          &mut arraybuffer_value,
+        )
       };
-      unsafe { std::ptr::copy_nonoverlapping(data.cast(), underlying_data, len) };
+      unsafe {
+        ptr::copy_nonoverlapping(data, underlying_data.cast::<u8>(), len);
+      }
       finalize(*env, hint);
-      status
-    } else {
-      status
-    };
+    }
+
     check_status!(status, "Failed to create arraybuffer from data")?;
+
+    // decide which pointer is really alive
+    let backing_ptr = if status == sys::Status::napi_no_external_buffers_allowed {
+      underlying_data.cast::<u8>()
+    } else {
+      data
+    };
+
+    #[cfg(all(debug_assertions, not(windows)))]
+    register_backing_ptr(backing_ptr);
 
     Ok(Self {
       value: Value {
@@ -281,7 +288,7 @@ impl<'env> ArrayBuffer<'env> {
       data: if len == 0 {
         &[]
       } else {
-        unsafe { std::slice::from_raw_parts(data.cast(), len) }
+        unsafe { std::slice::from_raw_parts(backing_ptr, len) }
       },
     })
   }
@@ -340,7 +347,7 @@ impl<'env> ArrayBuffer<'env> {
 trait Finalizer {
   type RustType;
 
-  fn finalizer_notify(&self) -> *mut dyn FnOnce(*mut Self::RustType, usize);
+  fn take_finalizer(&mut self) -> Option<Box<dyn FnOnce(*mut Self::RustType, usize)>>;
 
   fn byte_len(&self) -> usize;
 }
@@ -353,7 +360,7 @@ macro_rules! impl_typed_array {
       #[allow(unused)]
       byte_offset: usize,
       raw: Option<(crate::sys::napi_ref, crate::sys::napi_env)>,
-      finalizer_notify: *mut dyn FnOnce(*mut $rust_type, usize),
+      finalizer_notify: Option<Box<dyn FnOnce(*mut $rust_type, usize)>>,
       owned_by_rust: bool,
     }
 
@@ -367,8 +374,8 @@ macro_rules! impl_typed_array {
     impl Finalizer for $name {
       type RustType = $rust_type;
 
-      fn finalizer_notify(&self) -> *mut dyn FnOnce(*mut Self::RustType, usize) {
-        self.finalizer_notify
+      fn take_finalizer(&mut self) -> Option<Box<dyn FnOnce(*mut Self::RustType, usize)>> {
+        self.finalizer_notify.take()
       }
 
       fn byte_len(&self) -> usize {
@@ -378,14 +385,13 @@ macro_rules! impl_typed_array {
 
     impl Drop for $name {
       fn drop(&mut self) {
-        /* ------------------------------------------
-         *  A. Native data path (no napi_ref stored)
-         * -----------------------------------------*/
-        if self.raw.is_none() {
-          /* Only free if the buffer originated from Rust.              */
-          if self.owned_by_rust && !self.data.is_null() {
-            let len = self.length;
-            unsafe { Vec::from_raw_parts(self.data, len, len) };
+        if self.owned_by_rust {
+          self.drop_callback();
+        }
+
+        if self.raw.is_none() && self.owned_by_rust {
+          if !self.data.is_null() {
+            unsafe { Vec::from_raw_parts(self.data, self.length, self.length) };
           }
         }
 
@@ -425,6 +431,13 @@ macro_rules! impl_typed_array {
     }
 
     impl $name {
+      #[inline(always)]
+      fn drop_callback(&mut self) {
+        if let Some(cb) = self.finalizer_notify.take() {
+          cb(self.data, self.length);
+        }
+      }
+
       #[cfg(target_family = "wasm")]
       pub fn sync(&mut self, env: &crate::Env) {
         if let Some((reference, _)) = self.raw {
@@ -475,7 +488,7 @@ macro_rules! impl_typed_array {
           length: data.len(),
           byte_offset: 0,
           raw: None,
-          finalizer_notify: ptr::null_mut::<fn(*mut $rust_type, usize)>(),
+          finalizer_notify: None,
           owned_by_rust: true,
         };
         mem::forget(data);
@@ -490,7 +503,7 @@ macro_rules! impl_typed_array {
         let ret = $name {
           data: data_copied.as_mut_ptr(),
           length: data.as_ref().len(),
-          finalizer_notify: ptr::null_mut::<fn(*mut $rust_type, usize)>(),
+          finalizer_notify: None,
           owned_by_rust: true,
           raw: None,
           byte_offset: 0,
@@ -509,7 +522,7 @@ macro_rules! impl_typed_array {
         $name {
           data,
           length,
-          finalizer_notify: Box::into_raw(Box::new(notify)),
+          finalizer_notify: Some(Box::new(notify)),
           raw: None,
           owned_by_rust: true,
           byte_offset: 0,
@@ -615,7 +628,7 @@ macro_rules! impl_typed_array {
           byte_offset,
           raw: None,
           owned_by_rust: false,
-          finalizer_notify: ptr::null_mut::<fn(*mut $rust_type, usize)>(),
+          finalizer_notify: None,
         })
       }
     }
@@ -649,7 +662,21 @@ macro_rules! impl_typed_array {
               sys::napi_create_arraybuffer(env, length, ptr::null_mut(), &mut arraybuffer_value)
             }
           } else {
-            let hint_ptr = Box::into_raw(Box::new(val));
+            // pull the drop-callback out of `val`
+            let fin_cb = val.finalizer_notify.take();
+
+            // Build an independent owner that V8 will hold
+            let val_for_js = $name {
+              data: val.data,
+              length: val.length,
+              byte_offset: val.byte_offset,
+              raw: None,           // JS copy keeps no napi_ref
+              owned_by_rust: true, // it must free the data later
+              finalizer_notify: fin_cb,
+            };
+
+            // leak the clone to V8, not the original `val`
+            let hint_ptr = Box::into_raw(Box::new(val_for_js));
             let status = unsafe {
               sys::napi_create_external_arraybuffer(
                 env,
@@ -693,6 +720,13 @@ macro_rules! impl_typed_array {
           },
           "Create TypedArray failed"
         )?;
+        // We handed the buffer to V8 -> drop our callback so we don’t run it
+        // twice if Rust side gets dropped first.
+        if let Some(cb) = val.take_finalizer() {
+          cb(val.data, val.length);
+        }
+        val.raw = None;
+        val.owned_by_rust = false;
         Ok(napi_val)
       }
     }
@@ -724,13 +758,14 @@ macro_rules! impl_typed_array {
           } else {
             // manually copy the data instead of implement `Clone` & `Copy` for TypedArray
             // the TypedArray can't be copied if raw is not None
+            let fin_cb = val.finalizer_notify.take();
             let val_copy = $name {
               data: val.data,
               length: val.length,
               byte_offset: val.byte_offset,
               raw: None,
               owned_by_rust: true,
-              finalizer_notify: val.finalizer_notify,
+              finalizer_notify: fin_cb,
             };
             let hint_ref: &mut $name = Box::leak(Box::new(val_copy));
             let hint_ptr = hint_ref as *mut $name;
@@ -779,16 +814,24 @@ macro_rules! impl_typed_array {
           "Create TypedArray failed"
         )?;
 
+        // Run the drop-callback before we overwrite the pointer/len,
+        // otherwise the cb would receive NULL/0.
+        if let Some(cb) = val.finalizer_notify.take() {
+          cb(val.data, val.length);
+        }
+
+        // Give up ownership of the storage that is now held by V8.
         val.raw = None;
         val.owned_by_rust = false;
+        val.data = ptr::null_mut();
+        val.length = 0;
 
-        if let Some(copied_val) = copied_val {
-          // we no longer keep a napi_ref, so the clone carries `None`
-          val.finalizer_notify = ptr::null_mut::<fn(*mut $rust_type, usize)>();
-          val.data = ptr::null_mut();
-          val.length = 0;
-          copied_val.raw = None;
+        // A clone was leaked to V8 (`copied_val`) – make sure that clone
+        // no longer tries to free the memory either.
+        if let Some(clone) = copied_val {
+          clone.raw = None;
         }
+
         Ok(napi_val)
       }
     }
@@ -806,63 +849,63 @@ macro_rules! impl_from_slice {
       _marker: PhantomData<&'env ()>,
     }
 
-    impl <'env> $slice_type<'env> {
+    impl<'env> $slice_type<'env> {
       #[doc = " Create a new `"]
       #[doc = stringify!($slice_type)]
       #[doc = "` from a `Vec<"]
       #[doc = stringify!($rust_type)]
       #[doc = ">`."]
-      pub fn from_data<D: Into<Vec<u8>>>(env: &Env, data: D) -> Result<Self> {
+      pub fn from_data<D: Into<Vec<$rust_type>>>(env: &Env, data: D) -> Result<Self> {
         let mut buf = ptr::null_mut();
         let mut data = data.into();
         let mut inner_ptr = data.as_mut_ptr();
-        #[cfg(all(debug_assertions, not(windows)))]
-        {
-          let is_existed = super::BUFFER_DATA.with(|buffer_data| {
-            let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-            buffer.contains(&inner_ptr)
-          });
-          if is_existed {
-            panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-          }
-        }
-        let len = data.len();
-        // tell V8 how many bytes live outside the JS heap
+
+        // element count vs. byte count
+        let len_elems = data.len();
+        let len_bytes = len_elems * core::mem::size_of::<$rust_type>();
+
+        // Tell V8 how many bytes live outside the JS heap
         let mut _dummy = 0;
         check_status!(
-            unsafe { sys::napi_adjust_external_memory(env.0, len as i64, &mut _dummy) },
-            "adjust external memory"
+          unsafe { sys::napi_adjust_external_memory(env.0, len_bytes as i64, &mut _dummy) },
+          "adjust external memory"
         )?;
 
         let mut status = unsafe {
           let cap = data.capacity();
-
           sys::napi_create_external_arraybuffer(
             env.0,
             inner_ptr.cast(),
-            data.len(),
+            len_bytes,
             Some(finalize_slice::<$rust_type>),
-            Box::into_raw(Box::new((len, cap))).cast(),
+            Box::into_raw(Box::new((len_elems, cap))).cast(),
             &mut buf,
           )
         };
+
         if status == napi_sys::Status::napi_no_external_buffers_allowed {
-          let mut inner_data = unsafe { Vec::from_raw_parts(inner_ptr, data.len(), data.len()) };
-          let mut underlying_data = ptr::null_mut();
+          let mut inner_data = unsafe { Vec::from_raw_parts(inner_ptr, len_elems, len_elems) };
+          let mut underlying_data: *mut c_void = ptr::null_mut();
           status = unsafe {
-            sys::napi_create_arraybuffer(
-              env.0,
-              data.len(),
-              &mut underlying_data,
-              &mut buf,
-            )
+            sys::napi_create_arraybuffer(env.0, len_bytes, &mut underlying_data, &mut buf)
           };
-          unsafe { std::ptr::copy_nonoverlapping(inner_data.as_mut_ptr().cast(), underlying_data, data.len()) };
+          unsafe {
+            ptr::copy_nonoverlapping(
+              inner_data.as_mut_ptr().cast::<u8>(),
+              underlying_data.cast::<u8>(),
+              len_bytes,
+            );
+          }
           inner_ptr = underlying_data.cast();
         } else {
           mem::forget(data);
         }
         check_status!(status, "Failed to create buffer slice from data")?;
+
+        #[cfg(all(debug_assertions, not(windows)))]
+        if len_elems != 0 {
+          register_backing_ptr(inner_ptr.cast::<u8>());
+        }
 
         let mut napi_val = ptr::null_mut();
         check_status!(
@@ -870,7 +913,7 @@ macro_rules! impl_from_slice {
             sys::napi_create_typedarray(
               env.0,
               $typed_array_type as i32,
-              len,
+              len_elems,
               buf,
               0,
               &mut napi_val,
@@ -880,36 +923,18 @@ macro_rules! impl_from_slice {
         )?;
 
         Ok(Self {
-          inner: if len == 0 {
+          inner: if len_elems == 0 {
             NonNull::dangling()
           } else {
             unsafe { NonNull::new_unchecked(inner_ptr.cast()) }
           },
-          length: len,
+          length: len_elems,
           raw_value: napi_val,
           env: env.0,
           _marker: PhantomData,
         })
       }
 
-      #[doc = "## Safety"]
-      #[doc = ""]
-      #[doc = "Mostly the same with `from_data`"]
-      #[doc = ""]
-      #[doc = "Provided `finalize_callback` will be called when `"]
-      #[doc = stringify!($slice_type)]
-      #[doc = "` got dropped."]
-      #[doc = ""]
-      #[doc = "You can pass in `noop_finalize` if you have nothing to do in finalize phase."]
-      #[doc = ""]
-      #[doc = "### Notes"]
-      #[doc = ""]
-      #[doc = "JavaScript may mutate the data passed in to this buffer when writing the buffer."]
-      #[doc = "However, some JavaScript runtimes do not support external buffers (notably electron!)"]
-      #[doc = "in which case modifications may be lost."]
-      #[doc = ""]
-      #[doc = "If you need to support these runtimes, you should create a buffer by other means and then"]
-      #[doc = "later copy the data back out."]
       pub unsafe fn from_external<T: 'env, F: FnOnce(Env, T)>(
         env: &Env,
         data: *mut u8,
@@ -923,45 +948,48 @@ macro_rules! impl_from_slice {
             "Borrowed data should not be null".to_owned(),
           ));
         }
-        #[cfg(all(debug_assertions, not(windows)))]
-        {
-          let is_existed = super::BUFFER_DATA.with(|buffer_data| {
-            let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-            buffer.contains(&data)
-          });
-          if is_existed {
-            panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-          }
-        }
+
+        let len_bytes = len * core::mem::size_of::<$rust_type>();
+
         let hint_ptr = Box::into_raw(Box::new((finalize_hint, finalize_callback)));
+
         let mut arraybuffer_value = ptr::null_mut();
         let mut status = unsafe {
           sys::napi_create_external_arraybuffer(
             env.0,
             data.cast(),
-            len,
+            len_bytes,
             Some(crate::env::raw_finalize_with_custom_callback::<T, F>),
             hint_ptr.cast(),
             &mut arraybuffer_value,
           )
         };
-        status = if status == sys::Status::napi_no_external_buffers_allowed {
+
+        let mut underlying_data: *mut c_void = ptr::null_mut();
+        if status == sys::Status::napi_no_external_buffers_allowed {
           let (hint, finalize) = *Box::from_raw(hint_ptr);
-          let mut underlying_data = ptr::null_mut();
-          let status = unsafe {
+          status = unsafe {
             sys::napi_create_arraybuffer(
               env.0,
-              len,
+              len_bytes,
               &mut underlying_data,
               &mut arraybuffer_value,
             )
           };
-          unsafe { std::ptr::copy_nonoverlapping(data.cast(), underlying_data, len) };
+          unsafe { ptr::copy_nonoverlapping(data, underlying_data.cast::<u8>(), len_bytes) };
           finalize(*env, hint);
-          status
-        } else {
-          status
-        };
+        }
+
+        #[cfg(all(debug_assertions, not(windows)))]
+        {
+          let ptr_to_track = if status == sys::Status::napi_no_external_buffers_allowed {
+            underlying_data // new buffer allocated above
+          } else {
+            data.cast::<c_void>() // original external buffer
+          };
+          register_backing_ptr(ptr_to_track.cast::<u8>());
+        }
+
         check_status!(status, "Failed to create arraybuffer from data")?;
 
         let mut napi_val = ptr::null_mut();
@@ -983,7 +1011,11 @@ macro_rules! impl_from_slice {
           inner: if len == 0 {
             NonNull::dangling()
           } else {
-            unsafe { NonNull::new_unchecked(data.cast()) }
+            NonNull::new_unchecked(if status == sys::Status::napi_no_external_buffers_allowed {
+              underlying_data.cast()
+            } else {
+              data.cast()
+            })
           },
           length: len,
           raw_value: napi_val,
@@ -991,7 +1023,6 @@ macro_rules! impl_from_slice {
           _marker: PhantomData,
         })
       }
-
       #[doc = "Copy data from a `&["]
       #[doc = stringify!($rust_type)]
       #[doc = "]` and create a `"]
@@ -1005,12 +1036,7 @@ macro_rules! impl_from_slice {
 
         check_status!(
           unsafe {
-            sys::napi_create_arraybuffer(
-              env.0,
-              len,
-              &mut underlying_data,
-              &mut arraybuffer_value,
-            )
+            sys::napi_create_arraybuffer(env.0, len, &mut underlying_data, &mut arraybuffer_value)
           },
           "Failed to create ArrayBuffer"
         )?;
@@ -1044,12 +1070,26 @@ macro_rules! impl_from_slice {
       }
 
       /// Create from `ArrayBuffer`
-      pub fn from_arraybuffer(arraybuffer: &ArrayBuffer<'env>, byte_offset: usize, length: usize) -> Result<$slice_type<'env>> {
+      pub fn from_arraybuffer(
+        arraybuffer: &ArrayBuffer<'env>,
+        byte_offset: usize,
+        length: usize,
+      ) -> Result<$slice_type<'env>> {
         let env = arraybuffer.value.env;
         let mut typed_array = ptr::null_mut();
-        check_status!(unsafe {
-          sys::napi_create_typedarray(env, $typed_array_type.into(), length, arraybuffer.value().value, byte_offset, &mut typed_array)
-        }, "Failed to create TypedArray from ArrayBuffer")?;
+        check_status!(
+          unsafe {
+            sys::napi_create_typedarray(
+              env,
+              $typed_array_type.into(),
+              length,
+              arraybuffer.value().value,
+              byte_offset,
+              &mut typed_array,
+            )
+          },
+          "Failed to create TypedArray from ArrayBuffer"
+        )?;
 
         unsafe { FromNapiValue::from_napi_value(env, typed_array) }
       }
@@ -1061,7 +1101,9 @@ macro_rules! impl_from_slice {
       {
         let name = CString::new(name)?;
         check_status!(
-          unsafe { sys::napi_set_named_property(self.env, this.object.raw(), name.as_ptr(), self.raw_value) },
+          unsafe {
+            sys::napi_set_named_property(self.env, this.object.raw(), name.as_ptr(), self.raw_value)
+          },
           "Failed to assign {} to this",
           $slice_type::type_name()
         )?;
@@ -1096,7 +1138,7 @@ macro_rules! impl_from_slice {
       }
     }
 
-    impl<'env> JsObjectValue<'env> for $slice_type<'env> { }
+    impl<'env> JsObjectValue<'env> for $slice_type<'env> {}
 
     impl ToNapiValue for &$slice_type<'_> {
       unsafe fn to_napi_value(_: sys::napi_env, val: Self) -> Result<sys::napi_value> {
@@ -1332,7 +1374,7 @@ macro_rules! impl_from_slice {
 }
 
 unsafe extern "C" fn finalizer<Data, T: Finalizer<RustType = Data>>(
-  _env: sys::napi_env,
+  env: sys::napi_env,
   _finalize_data: *mut c_void,
   finalize_hint: *mut c_void,
 ) {
@@ -1340,11 +1382,12 @@ unsafe extern "C" fn finalizer<Data, T: Finalizer<RustType = Data>>(
 
   let data: T = *Box::from_raw(finalize_hint.cast::<T>());
 
-  if !_env.is_null() {
+  if !env.is_null() {
     let mut _dummy = 0;
-    sys::napi_adjust_external_memory(_env, -(data.byte_len() as i64), &mut _dummy);
+    // tell V8 the bytes are gone
+    sys::napi_adjust_external_memory(env, -(data.byte_len() as i64), &mut _dummy);
   }
-
+  // now drop them
   drop(data);
   crate::bindgen_runtime::IN_FINALISER.with(|f| f.set(false));
 }
@@ -1354,8 +1397,11 @@ unsafe extern "C" fn finalize_slice<Data>(
   finalize_data: *mut c_void,
   finalize_hint: *mut c_void,
 ) {
-  let (length, cap) = *Box::from_raw(finalize_hint as *mut (usize, usize));
-  Vec::from_raw_parts(finalize_data as *mut Data, length, cap);
+  #[cfg(all(debug_assertions, not(windows)))]
+  unregister_backing_ptr(finalize_data as *mut u8);
+
+  let (length, cap) = *Box::from_raw(finalize_hint.cast::<(usize, usize)>());
+  Vec::from_raw_parts(finalize_data.cast::<Data>(), length, cap);
 
   // balance external-memory counter
   let mut _dummy = 0;
@@ -1413,16 +1459,20 @@ impl Uint8Array {
   pub fn from_string(mut s: String) -> Self {
     let len = s.len();
     let cap = s.capacity();
+
     let ret = Self {
       data: s.as_mut_ptr(),
       length: len,
       owned_by_rust: true,
-      finalizer_notify: Box::into_raw(Box::new(move |data, _| {
+      finalizer_notify: Some(Box::new(move |data, _| {
+        // Re-create the String so Rust will free it.
         drop(unsafe { String::from_raw_parts(data, len, cap) });
       })),
       byte_offset: 0,
       raw: None,
     };
+
+    // Prevent Rust from freeing the String now – JS owns it.
     mem::forget(s);
     ret
   }
@@ -1546,17 +1596,8 @@ impl<'env> Uint8ClampedSlice<'env> {
     let mut buf = ptr::null_mut();
     let mut data = data.into();
     let mut inner_ptr = data.as_mut_ptr();
-    #[cfg(all(debug_assertions, not(windows)))]
-    {
-      let is_existed = super::BUFFER_DATA.with(|buffer_data| {
-        let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-        buffer.contains(&inner_ptr)
-      });
-      if is_existed {
-        panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-      }
-    }
     let len = data.len();
+
     // tell V8 how many bytes live outside the JS heap
     let mut _dummy = 0;
     check_status!(
@@ -1566,30 +1607,36 @@ impl<'env> Uint8ClampedSlice<'env> {
 
     let mut status = unsafe {
       let cap = data.capacity();
-
       sys::napi_create_external_arraybuffer(
         env.0,
         inner_ptr.cast(),
-        data.len(),
+        len,
         Some(finalize_slice::<u8>),
         Box::into_raw(Box::new((len, cap))).cast(),
         &mut buf,
       )
     };
+
     if status == napi_sys::Status::napi_no_external_buffers_allowed {
-      let mut inner_data = unsafe { Vec::from_raw_parts(inner_ptr, data.len(), data.len()) };
+      // Fallback: allocate a fresh ArrayBuffer
+      let mut inner_data = unsafe { Vec::from_raw_parts(inner_ptr, len, len) };
       let mut underlying_data = ptr::null_mut();
-      status =
-        unsafe { sys::napi_create_arraybuffer(env.0, data.len(), &mut underlying_data, &mut buf) };
+      status = unsafe { sys::napi_create_arraybuffer(env.0, len, &mut underlying_data, &mut buf) };
       unsafe {
-        std::ptr::copy_nonoverlapping(inner_data.as_mut_ptr().cast(), underlying_data, data.len())
-      };
+        std::ptr::copy_nonoverlapping(inner_data.as_mut_ptr().cast(), underlying_data, len);
+      }
       inner_ptr = underlying_data.cast();
     } else {
       mem::forget(data);
     }
     check_status!(status, "Failed to create buffer slice from data")?;
 
+    #[cfg(all(debug_assertions, not(windows)))]
+    {
+      register_backing_ptr(inner_ptr); // inner_ptr is final backing store
+    }
+
+    // create TypedArray
     let mut napi_val = ptr::null_mut();
     check_status!(
       unsafe {
@@ -1650,15 +1697,7 @@ impl<'env> Uint8ClampedSlice<'env> {
       ));
     }
     #[cfg(all(debug_assertions, not(windows)))]
-    {
-      let is_existed = super::BUFFER_DATA.with(|buffer_data| {
-        let buffer = buffer_data.lock().expect("Unlock buffer data failed");
-        buffer.contains(&data)
-      });
-      if is_existed {
-        panic!("Share the same data between different buffers is not allowed, see: https://github.com/nodejs/node/issues/32463#issuecomment-631974747");
-      }
-    }
+    register_backing_ptr(data);
     let hint_ptr = Box::into_raw(Box::new((finalize_hint, finalize_callback)));
     let mut arraybuffer_value = ptr::null_mut();
     let mut status = unsafe {

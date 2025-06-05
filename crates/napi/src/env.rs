@@ -16,6 +16,9 @@ use serde::de::DeserializeOwned;
 #[cfg(feature = "serde-json")]
 use serde::Serialize;
 
+#[cfg(all(debug_assertions, not(windows)))]
+use crate::bindgen_prelude::unregister_backing_ptr;
+
 #[cfg(feature = "napi8")]
 use crate::async_cleanup_hook::AsyncCleanupHook;
 #[cfg(all(feature = "napi6", feature = "compat-mode"))]
@@ -1463,6 +1466,9 @@ unsafe extern "C" fn drop_buffer(
   finalize_data: *mut c_void,
   hint: *mut c_void,
 ) {
+  #[cfg(all(debug_assertions, not(windows)))]
+  unregister_backing_ptr(finalize_data as *mut u8);
+
   let length_ptr = hint as *mut (usize, usize);
   let (length, cap) = unsafe { *Box::from_raw(length_ptr) };
   mem::drop(unsafe { Vec::from_raw_parts(finalize_data as *mut u8, length, cap) });
